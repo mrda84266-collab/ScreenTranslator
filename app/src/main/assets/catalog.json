@@ -1,0 +1,34 @@
+{
+  "qr": {
+    "aliases": [
+      "qr",
+      "qrcode",
+      "کیوآر"
+    ],
+    "pip": [
+      "qrcode",
+      "pillow"
+    ],
+    "hint": "Use the qrcode library and save a PNG in ./outputs/."
+  },
+  "image_generation": {
+    "enabled": false,
+    "aliases": [
+      "generate image",
+      "image generation",
+      "تصویر بساز",
+      "عکس بساز"
+    ],
+    "pip": [],
+    "download": [],
+    "hint": "TEMPLATE: put your verified image-gen binary/model paths here (e.g. a stable-diffusion.cpp build plus a small model) and call it with subprocess from run(). Fill 'download' with url/dest/sha256, then set enabled to true."
+  },
+  "game": {
+    "aliases": [
+      "game",
+      "بازی"
+    ],
+    "pip": [],
+    "hint": "Create ONE self-contained HTML5 game file (canvas + JS, keyboard AND touch controls) saved to ./outputs/<name>.html and return the relative path outputs/<name>.html. selftest must check the file exists and contains '<canvas', 'requestAnimationFrame' and an event listener."
+  }
+}
