@@ -15,6 +15,18 @@ android {
         versionName = "1.0"
         ndk { abiFilters += "arm64-v8a" }
     }
+    // کلید ثابت: هر بیلد با همین امضا ساخته می‌شود تا اپ بدون حذف و از دست رفتن مدل‌ها آپدیت شود (برای نصب شخصی؛ مناسب انتشار عمومی نیست)
+    signingConfigs {
+        create("nexora") {
+            storeFile = file("nexora.jks")
+            storePassword = "nexora123"
+            keyAlias = "nexora"
+            keyPassword = "nexora123"
+        }
+    }
+    buildTypes {
+        getByName("debug") { signingConfig = signingConfigs.getByName("nexora") }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

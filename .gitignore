@@ -3,4 +3,5 @@ build/
 llama.cpp/
 app/src/main/jniLibs/
 local.properties
+!app/nexora.jks
 app/src/main/assets/engines/

@@ -262,7 +262,8 @@ def _port_free(port):
 
 def tail(path, n=500):
     try:
-        return "لاگ: " + Path(path).read_text(errors="ignore")[-n:].strip()
+        t = Path(path).read_text(errors="ignore").strip()
+        return "لاگ: " + (t if len(t) <= n else t[: n // 2] + " … " + t[-n // 2:])
     except Exception:
         return ""
 
@@ -278,6 +279,31 @@ def unload(mid):
                 s["p"].kill()
 
 
+def _mem_available_mb():
+    try:
+        for l in open("/proc/meminfo"):
+            if l.startswith("MemAvailable:"):
+                return int(l.split()[1]) // 1024
+    except Exception:
+        pass
+    return None
+
+
+def preflight(path):
+    """قبل از اجرا: سالم بودن فایل (هدر GGUF) و کافی بودن RAM را جدا از هم گزارش می‌کند."""
+    if os.environ.get("SELFDEV_NOCHECK"):
+        return
+    size_mb = path.stat().st_size // (1 << 20)
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise RuntimeError(f"فایل مدل خراب یا ناقص است (هدر GGUF ندارد، {size_mb}MB). دوباره دانلود کن یا فایل سالم وارد کن.")
+    free = _mem_available_mb()
+    need = int(size_mb * 1.3) + 300  # وزن‌ها + KV cache + سربار
+    if free is not None and free < need:
+        raise RuntimeError(f"رم کافی نیست: برای این مدل حدود {need}MB لازم است و فقط {free}MB آزاد است. برنامه‌های دیگر را ببند، "
+                           "حداکثر مدل هم‌زمان را روی ۱ بگذار، یا مدل کوچکتر (مثلا 0.5B یا کوانتیزه‌ی Q4) بردار.")
+
+
 def load(mid, wait=240):
     """مدل محلی را (در صورت نیاز با خارج‌کردن قدیمی‌ترین مدل) بالا می‌آورد و پورتش را برمی‌گرداند."""
     with LOCK:
@@ -291,6 +317,7 @@ def load(mid, wait=240):
         servers.pop(mid, None)
         if not (shutil.which(LLAMA) or Path(LLAMA).exists()):
             raise RuntimeError("llama-server پیدا نشد. در Termux: pkg install llama-cpp (یا مسیرش را در LLAMA_SERVER بگذار)")
+        preflight(MODELS / r["models"][mid]["file"])
         alive = [m for m in servers if _alive(m)]
         while len(alive) >= max(1, int(r["max_loaded"])):
             lru = min(alive, key=lambda m: servers[m]["t"])
@@ -299,9 +326,12 @@ def load(mid, wait=240):
         used = {x["port"] for x in servers.values()}
         port = next(p for p in range(PORT0, PORT0 + 60) if p not in used and _port_free(p))
         log = LOGS / f"llama_{mid}.log"
-        cmd = [LLAMA, "-m", str(MODELS / r["models"][mid]["file"]), "--host", "127.0.0.1", "--port", str(port), "-c", "4096"]
+        threads = os.environ.get("LLAMA_THREADS") or str(min(4, os.cpu_count() or 4))
+        cmd = [LLAMA, "-m", str(MODELS / r["models"][mid]["file"]), "--host", "127.0.0.1", "--port", str(port),
+               "-c", os.environ.get("LLAMA_CTX", "3072"), "-t", threads]
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LD_")}  # کتابخانه‌های پایتونِ اپ نباید به llama-server نشت کنند
         with open(log, "wb") as lf:
-            p = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+            p = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, env=env)
         servers[mid] = {"p": p, "port": port, "t": time.time(), "log": log}
         t0 = time.time()
         while time.time() - t0 < wait:
