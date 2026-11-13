@@ -11,7 +11,7 @@ SelfDev Agent - عامل خودتوسعه‌گر برای LLM کوچک (مثلا
 قانون ایمنی: فقط پوشه plugins/ قابل تغییر توسط مدل است. هسته (همین فایل) را مدل دست نمی‌زند.
 هر pip install و هر دانلود فقط با تایید شما (مگر با --yes).
 """
-import json, os, re, subprocess, sys, shutil, time, hashlib, urllib.request
+import json, os, re, subprocess, sys, shutil, time, hashlib, urllib.request, urllib.error
 from pathlib import Path
 
 ROOT = Path(os.environ.get("SELFDEV_HOME") or Path(__file__).resolve().parent)
@@ -75,12 +75,17 @@ Reply with JSON only:
 ENDPOINTS = {"brain": LLM_URL, "advisor": None, "bench": None}
 
 
+RESOLVER = None    # تابع models.resolve: نقش/پروفایل -> endpoint (توسط models.py تنظیم می‌شود)
+ADVISOR_FN = None  # تابع models.advisor_pid
+
+
 def has_advisor():
-    return bool(ENDPOINTS.get("advisor"))
+    return bool(ADVISOR_FN and ADVISOR_FN()) if ADVISOR_FN else bool(ENDPOINTS.get("advisor"))
 
 
 def llm(prompt, json_mode=False, role="brain"):
-    ep = ENDPOINTS.get(role) or LLM_URL
+    ep = RESOLVER(role) if (RESOLVER and role != "bench") else None
+    ep = ep or ENDPOINTS.get(role) or LLM_URL
     if isinstance(ep, str):
         ep = {"url": ep}
     body = {"messages": [{"role": "user", "content": prompt}], "temperature": 0.2, "max_tokens": 1500}
@@ -92,8 +97,13 @@ def llm(prompt, json_mode=False, role="brain"):
     if ep.get("key"):
         headers["Authorization"] = "Bearer " + ep["key"]
     req = urllib.request.Request(ep["url"], json.dumps(body).encode(), headers)
-    with urllib.request.urlopen(req, timeout=600) as r:
-        return json.load(r)["choices"][0]["message"]["content"]
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return json.load(r)["choices"][0]["message"]["content"]
+    except urllib.error.URLError as e:
+        if "refused" in str(e).lower():
+            raise RuntimeError("هنوز هیچ مدلی در حال اجرا نیست. به تب «مدل‌ها» برو، یک مدل دانلود کن و روی «مغز» بزن.") from e
+        raise
 
 
 ADVISE = """You are a senior reviewer. This code should provide: {need}
@@ -106,12 +116,8 @@ In under 120 words explain the root cause and the exact fix. No code block longe
 
 
 def council(prompt):
-    """دو مغز: brain پیش‌نویس می‌دهد، advisor نقد می‌کند، brain نسخه نهایی را می‌نویسد."""
-    draft = llm(prompt)
-    if not has_advisor():
-        return draft
-    critique = llm(f"Question:\n{prompt}\n\nDraft answer:\n{draft}\n\nList mistakes or missing points briefly (under 100 words).", role="advisor")
-    return llm(f"Question:\n{prompt}\n\nDraft:\n{draft}\n\nReviewer notes:\n{critique}\n\nWrite the final improved answer in the user's language.")
+    import engine
+    return engine.answer(prompt, mode="debate")
 
 
 def extract_code(t):
@@ -231,6 +237,20 @@ def tools():
     return out
 
 
+def seed():
+    """ابزارهای داخلی را (اگر نیستند یا نسخه‌شان قدیمی‌تر است) در plugins/ می‌کارد. اگر عامل ابزار را تغییر داده باشد دست نمی‌خورد."""
+    from builtins_seed import SEEDS
+    for name, src in SEEDS.items():
+        f = PLUG / f"{name}.py"
+        ver = int(re.search(r"# builtin v(\d+)", src).group(1))
+        if f.exists():
+            m = re.search(r"# builtin v(\d+)", f.read_text())
+            if not m or int(m.group(1)) >= ver:
+                continue
+            shutil.copy(f, BAK / f"{name}.{int(time.time())}.py")
+        f.write_text(src)
+
+
 def install_plugin(name, src_path):
     dst = PLUG / f"{name}.py"
     if dst.exists():
@@ -249,24 +269,31 @@ def pip_install(pkg):
 
 
 def catalog_prepare(text):
-    """اگر قابلیت در catalog (دستور نصب تاییدشده توسط خودتان) بود نصب می‌کند و hint برمی‌گرداند."""
+    """هر قابلیت catalog که با درخواست بخواند: pip/دانلود را انجام می‌دهد و hint ها را جمع می‌کند."""
+    hints = []
     for key, e in load(CATALOG, {}).items():
         if e.get("enabled", True) is False:
             continue
-        if any(a.lower() in text.lower() for a in e.get("aliases", [key])):
-            for pkg in e.get("pip", []):
-                pip_install(pkg)
-            for d in e.get("download", []):
-                dest = ROOT / d["dest"]
-                if dest.exists() or not confirm(f"دانلود {d['url']} -> {d['dest']}؟", "download", d["url"]):
-                    continue
+        if not any(a.lower() in text.lower() for a in e.get("aliases", [key])):
+            continue
+        for pkg in e.get("pip", []):
+            pip_install(pkg)
+        for d in e.get("download", []):
+            dest = ROOT / d["dest"]
+            if dest.exists() or not confirm(f"دانلود {d['url']} -> {d['dest']}؟", "download", d["url"]):
+                continue
+            try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 urllib.request.urlretrieve(d["url"], dest)
+                print(f"دانلود شد: {d['dest']}")
                 if d.get("sha256") and hashlib.sha256(dest.read_bytes()).hexdigest() != d["sha256"]:
                     dest.unlink()
                     print("sha256 نامعتبر، فایل حذف شد")
-            return "Hint: " + e.get("hint", "")
-    return ""
+            except Exception as ex:
+                print(f"دانلود ناموفق ({d['url']}): {ex}")
+                dest.unlink(missing_ok=True)
+        hints.append(e.get("hint", ""))
+    return ("Hint: " + " ".join(hints)) if hints else ""
 
 
 # ---------- آنلاین/آفلاین ----------
@@ -391,15 +418,29 @@ def health():
 
 
 # ---------- حلقه اصلی ----------
+TASK_RE = re.compile(r"بساز|ساختن|درست کن|ایجاد|طراحی کن|دانلود|نصب|اضافه کن|تولید|پیوست|uploads/|build|make |create|generate|download|install|write a|add a", re.I)
+
+
+def is_task(request, tool_names=()):
+    """تشخیص ساده‌ی «درخواست کار» از «گفتگو»: مدل کوچک نباید برای «سلام» دنبال ساخت ابزار برود."""
+    return bool(TASK_RE.search(request)) or any(n in request for n in tool_names)
+
+
+def chat_reply(request, history=""):
+    import engine
+    prompt = (f"Conversation so far:\n{history}\n\n" if history else "") + f"User: {request}\nAnswer helpfully and briefly in the user's language."
+    return engine.answer(prompt)
+
+
 def handle(request, depth=0, history=""):
     t = tools()
+    if depth == 0 and not is_task(request, t):
+        return chat_reply(request, history)
     listing = "\n".join(f"- {k}: {v}" for k, v in t.items()) or "(none)"
     route = extract_json(llm(ROUTER.format(tools=listing, request=request, history=history or "(none)"), json_mode=True))
     name = route.get("tool", "NONE")
-    if name == "CHAT" and has_advisor() and len(request) > 120:
-        return council(f"{history}\nUser: {request}\nAnswer in the user's language.")
     if name == "CHAT":
-        return route.get("reply") or llm(f"{history}\nUser: {request}\nAnswer briefly in the user's language.")
+        return chat_reply(request, history)
     if name in t:
         args = route.get("args") or {}
         ok, out, err = sandbox(PLUG / f"{name}.py", "run", args)

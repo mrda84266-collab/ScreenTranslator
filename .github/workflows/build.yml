@@ -37,6 +37,13 @@ jobs:
           "$NDK"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip app/src/main/jniLibs/arm64-v8a/libllama_server.so
           ls -l app/src/main/jniLibs/arm64-v8a/
 
+      # موتور بازی حرفه‌ای Phaser 3 داخل APK گذاشته می‌شود تا عامل بازی را با موتور بسازد، نه با کد خام
+      - name: Fetch Phaser engine
+        run: |
+          mkdir -p app/src/main/assets/engines
+          curl -fL https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js -o app/src/main/assets/engines/phaser.min.js || echo "::warning::phaser download failed"
+          ls -l app/src/main/assets/engines/
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7

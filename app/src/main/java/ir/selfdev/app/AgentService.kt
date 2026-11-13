@@ -32,7 +32,7 @@ class AgentService : Service() {
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
         val n = Notification.Builder(this, "agent")
-            .setContentTitle("SelfDev در حال کار است")
+            .setContentTitle("NEXORA در حال کار است")
             .setContentText("برای باز کردن لمس کن")
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentIntent(open)
@@ -54,6 +54,11 @@ class AgentService : Service() {
                     for (name in listOf("catalog.json", "models_catalog.json")) {
                         val f = File(filesDir, name)
                         if (!f.exists()) assets.open(name).use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+                    }
+                    // موتورهای آماده (مثل Phaser) که از مسیر /engines/ سرو می‌شوند
+                    val eng = File(filesDir, "work/engines").apply { mkdirs() }
+                    for (n in assets.list("engines") ?: emptyArray()) {
+                        assets.open("engines/$n").use { i -> File(eng, n).outputStream().use { o -> i.copyTo(o) } }
                     }
                     if (!Python.isStarted()) Python.start(AndroidPlatform(this))
                     Python.getInstance().getModule("android_entry")

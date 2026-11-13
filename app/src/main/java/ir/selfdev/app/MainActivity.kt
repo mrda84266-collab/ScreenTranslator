@@ -3,11 +3,13 @@ package ir.selfdev.app
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ContentValues
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.webkit.JavascriptInterface
@@ -16,13 +18,16 @@ import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
+import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLConnection
 
 class MainActivity : Activity() {
     private lateinit var web: WebView
-    private val pickCode = 42
+    private val pickModelCode = 42
+    private val pickFileCode = 43
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,15 +65,15 @@ class MainActivity : Activity() {
         web.loadDataWithBaseURL(null, "<html dir='rtl'><meta name='viewport' content='width=device-width'>$body</html>", "text/html", "utf-8", null)
     }
 
+    private fun toast(msg: String) = runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+
     private fun askBatteryOnce() {
         val sp = getSharedPreferences("s", MODE_PRIVATE)
         if (sp.getBoolean("asked", false)) return
         sp.edit().putBoolean("asked", true).apply()
         if (!getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)) {
             try {
-                startActivity(
-                    Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
-                )
+                startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
             } catch (e: Exception) {
             }
         }
@@ -100,47 +105,83 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    /** وارد کردن فایل .gguf از حافظه‌ی گوشی (برای وقتی دانلود مستقیم ممکن نیست) */
+    private fun openPicker(code: Int) {
+        runOnUiThread {
+            val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+            }
+            startActivityForResult(i, code)
+        }
+    }
+
     inner class Bridge {
+        /** وارد کردن مدل .gguf از حافظه */
         @JavascriptInterface
-        fun pickModel() {
-            runOnUiThread {
-                val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                    addCategory(Intent.CATEGORY_OPENABLE)
-                    type = "*/*"
+        fun pickModel() = openPicker(pickModelCode)
+
+        /** پیوست فایل/عکس به چت */
+        @JavascriptInterface
+        fun pickFile() = openPicker(pickFileCode)
+
+        /** ذخیره‌ی خروجی ساخته‌شده (بازی، تصویر، ...) در پوشه‌ی Downloads گوشی */
+        @JavascriptInterface
+        fun save(name: String) {
+            val src = File(filesDir, "work/outputs/" + File(name).name)
+            if (!src.exists()) return toast("فایل پیدا نشد")
+            if (Build.VERSION.SDK_INT < 29) return toast("این قابلیت به اندروید ۱۰ یا بالاتر نیاز دارد")
+            try {
+                val v = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, src.name)
+                    put(MediaStore.Downloads.MIME_TYPE, URLConnection.guessContentTypeFromName(src.name) ?: "application/octet-stream")
                 }
-                startActivityForResult(i, pickCode)
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)!!
+                contentResolver.openOutputStream(uri)!!.use { o -> src.inputStream().use { it.copyTo(o) } }
+                toast("در Downloads ذخیره شد: ${src.name}")
+            } catch (e: Exception) {
+                toast("خطا: ${e.message}")
             }
         }
     }
 
-    @Deprecated("Deprecated in Java")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        val uri = data?.data ?: return
-        if (requestCode != pickCode || resultCode != RESULT_OK) return
-        var name = "imported.gguf"
+    private fun displayName(uri: Uri): String {
+        var name = "file"
         contentResolver.query(uri, null, null, null, null)?.use {
             if (it.moveToFirst()) {
                 val idx = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                 if (idx >= 0) name = it.getString(idx)
             }
         }
-        if (!name.endsWith(".gguf")) {
-            Toast.makeText(this, "فقط فایل .gguf", Toast.LENGTH_LONG).show()
-            return
+        return File(name).name
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val uri = data?.data ?: return
+        if (resultCode != RESULT_OK) return
+        val name = displayName(uri)
+        if (requestCode == pickModelCode) {
+            if (!name.endsWith(".gguf")) return toast("فقط فایل .gguf")
+            toast("در حال کپی $name … (چند دقیقه طول می‌کشد)")
+            copyIn(uri, File(filesDir, "models"), name) { toast("$name اضافه شد") }
+        } else if (requestCode == pickFileCode) {
+            copyIn(uri, File(filesDir, "work/uploads"), name) {
+                runOnUiThread { web.evaluateJavascript("onAttached(${JSONObject.quote(name)})", null) }
+            }
         }
-        val safe = File(name).name
-        Toast.makeText(this, "در حال کپی $safe … (چند دقیقه طول می‌کشد)", Toast.LENGTH_LONG).show()
+    }
+
+    private fun copyIn(uri: Uri, dir: File, name: String, done: () -> Unit) {
         Thread {
             try {
-                val dir = File(filesDir, "models").apply { mkdirs() }
-                val part = File(dir, "$safe.part")
+                dir.mkdirs()
+                val part = File(dir, "$name.part")
                 contentResolver.openInputStream(uri)!!.use { i -> part.outputStream().use { o -> i.copyTo(o, 1 shl 20) } }
-                part.renameTo(File(dir, safe))
-                runOnUiThread { Toast.makeText(this, "$safe اضافه شد", Toast.LENGTH_LONG).show() }
+                part.renameTo(File(dir, name))
+                done()
             } catch (e: Exception) {
-                runOnUiThread { Toast.makeText(this, "خطا: ${e.message}", Toast.LENGTH_LONG).show() }
+                toast("خطا: ${e.message}")
             }
         }.start()
     }

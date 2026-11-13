@@ -29,6 +29,45 @@
       "بازی"
     ],
     "pip": [],
-    "hint": "Create ONE self-contained HTML5 game file (canvas + JS, keyboard AND touch controls) saved to ./outputs/<name>.html and return the relative path outputs/<name>.html. selftest must check the file exists and contains '<canvas', 'requestAnimationFrame' and an event listener."
+    "hint": "Use the Phaser 3 game engine (a professional engine), not raw canvas: include <script src=\"/engines/phaser.min.js\"></script>, create new Phaser.Game(config) with scenes (preload/create/update), Arcade physics, touch input via this.input.on('pointerdown') plus cursor keys, Scale.FIT so it fits a phone screen. Save ONE html file to ./outputs/<name>.html and return 'outputs/<name>.html'. selftest must check the file exists and contains 'Phaser.Game' and '/engines/phaser.min.js'."
+  },
+  "three": {
+    "aliases": [
+      "three.js",
+      "threejs",
+      "3d game",
+      "بازی سه بعدی",
+      "بازی سه‌بعدی",
+      "سه بعدی",
+      "سه‌بعدی"
+    ],
+    "pip": [],
+    "download": [
+      {
+        "url": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.min.js",
+        "dest": "work/packs/three/three.module.min.js"
+      }
+    ],
+    "hint": "For 3D use three.js (professional 3D engine), already downloaded: in the generated HTML use <script type='module'> import * as THREE from '/packs/three/three.module.min.js'; build a scene, PerspectiveCamera, WebGLRenderer, animation loop, touch controls. Save ONE html file to ./outputs/<name>.html and return 'outputs/<name>.html'."
+  },
+  "tone": {
+    "aliases": [
+      "tone.js",
+      "music",
+      "موسیقی",
+      "آهنگ",
+      "اهنگ",
+      "sound",
+      "صدا",
+      "melody"
+    ],
+    "pip": [],
+    "download": [
+      {
+        "url": "https://cdn.jsdelivr.net/npm/tone@14.7.77/build/Tone.js",
+        "dest": "work/packs/tone/Tone.js"
+      }
+    ],
+    "hint": "For music/sound use Tone.js (professional audio library), already downloaded: <script src='/packs/tone/Tone.js'></script>; use Tone.Synth/PolySynth/Transport/Sequence; audio starts only after a user tap (await Tone.start()). Save ONE html file to ./outputs/<name>.html and return 'outputs/<name>.html'."
   }
 }

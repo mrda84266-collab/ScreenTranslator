@@ -1,25 +1,43 @@
-"""مدیر مدل‌ها: دانلود (با ادامه‌ی قطع‌شده)، حذف، بنچمارک خودکار، انتخاب مغز و مشاور، اجرای llama-server."""
-import hashlib, json, os, re, shutil, subprocess, sys, threading, time, urllib.request, urllib.error
+"""NEXORA - LLM Manager: پروفایل مدل‌ها (محلی GGUF و API سازگار با OpenAI/Ollama)، دانلود، بنچمارک،
+مدیریت منابع (حداکثر تعداد مدل محلیِ هم‌زمان در RAM با LRU) و لاگ llama-server."""
+import hashlib, json, os, re, shutil, socket, subprocess, sys, threading, time, urllib.request, urllib.error
 from pathlib import Path
 from urllib.parse import urlparse
 
 import agent
 
 ROOT = agent.ROOT
-MODELS = ROOT / "models"
+MODELS, LOGS = ROOT / "models", ROOT / "logs"
 MODELS.mkdir(exist_ok=True)
+LOGS.mkdir(exist_ok=True)
 REG, CAT = ROOT / "models.json", ROOT / "models_catalog.json"
 LLAMA = os.environ.get("LLAMA_SERVER", "llama-server")
 HF = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")  # برای آینه: HF_ENDPOINT=https://...
-PORTS = {"brain": 8080, "advisor": 8081, "bench": 8090}
-procs = {}  # role -> (Popen, model_id)
+PORT0 = int(os.environ.get("LLAMA_PORT0", "8080"))
+MODES = ("single", "auto", "specialist", "parallel", "debate", "consensus")
+TAGS = ("chat", "code", "review", "research")
+servers = {}  # model_id -> {"p": Popen, "port": int, "t": last_used, "log": Path}
 LOCK = threading.RLock()
 
 
+# ---------- رجیستری ----------
 def reg():
     r = agent.load(REG, {})
-    for k, v in {"active": None, "advisor": None, "remote_advisor": None, "models": {}}.items():
+    for k, v in {"models": {}, "profiles": {}, "meta": {}, "main": None, "mode": "single", "max_loaded": 2}.items():
         r.setdefault(k, v)
+    # مهاجرت از نسخه‌ی قبل (brain/advisor)
+    if "active" in r:
+        r["main"] = r.pop("active") or r["main"]
+    if "advisor" in r:
+        a = r.pop("advisor")
+        if a:
+            r["meta"].setdefault(a, {})["tags"] = ["review"]
+            if r["mode"] == "single":
+                r["mode"] = "debate"
+    ra = r.pop("remote_advisor", None)
+    if ra and ra.get("url"):
+        r["profiles"]["r:advisor"] = {"name": "Remote advisor", "provider": "openai", "url": norm_url(ra["url"]),
+                                      "key": ra.get("key", ""), "model": ra.get("model", ""), "tags": ["review"], "enabled": True}
     return r
 
 
@@ -28,7 +46,7 @@ def save(r):
 
 
 def sync():
-    """فایل‌های gguf دستی را هم به لیست اضافه می‌کند و ورودی‌های بی‌فایل را حذف می‌کند."""
+    """فایل‌های gguf دستی را اضافه می‌کند، ورودی‌های بی‌فایل را حذف می‌کند، و مغز را در صورت نبودن اولین مدل می‌گذارد."""
     with LOCK:
         r = reg()
         for f in MODELS.glob("*.gguf"):
@@ -36,11 +54,41 @@ def sync():
             r["models"][f.stem]["size_mb"] = round(f.stat().st_size / 1e6)
         for mid in [m for m, v in r["models"].items() if not (MODELS / v["file"]).exists()]:
             del r["models"][mid]
-            for role in ("active", "advisor"):
-                if r[role] == mid:
-                    r[role] = None
+            r["meta"].pop(mid, None)
+        if r["main"] and r["main"] not in r["models"] and r["main"] not in r["profiles"]:
+            r["main"] = None
+        if not r["main"] and r["models"]:
+            r["main"] = next(iter(r["models"]))
         save(r)
         return r
+
+
+def norm_url(u):
+    u = u.strip().rstrip("/")
+    if not re.match(r"https?://", u):
+        raise ValueError("آدرس باید با http:// یا https:// شروع شود")
+    if u.endswith("/chat/completions"):
+        return u
+    return (u if u.endswith("/v1") else u + "/v1") + "/chat/completions"
+
+
+def _alive(mid):
+    s = servers.get(mid)
+    return bool(s and s["p"].poll() is None)
+
+
+def plist():
+    r = reg()
+    out = []
+    for mid, m in r["models"].items():
+        meta = r["meta"].get(mid, {})
+        out.append({"id": mid, "name": mid, "provider": "local", "tags": meta.get("tags", ["chat", "code"]),
+                    "enabled": meta.get("enabled", True), "main": r["main"] == mid, "loaded": _alive(mid),
+                    "size_mb": m.get("size_mb"), "score": m.get("score"), "tps": m.get("tps")})
+    for pid, p in r["profiles"].items():
+        out.append({"id": pid, "name": p["name"], "provider": "api", "url": p["url"], "model": p.get("model", ""),
+                    "tags": p.get("tags", ["chat"]), "enabled": p.get("enabled", True), "main": r["main"] == pid, "loaded": None})
+    return out
 
 
 def catalog():
@@ -51,6 +99,95 @@ def catalog():
         c["downloaded"] = Path(urlparse(c["url"]).path).name in have
         out.append(c)
     return out
+
+
+def status():
+    r = reg()
+    m = r["main"]
+    if not m:
+        return {"main": None, "ready": False, "mode": r["mode"], "msg": "هنوز مدلی انتخاب نشده؛ به تب «مدل‌ها» برو"}
+    if m in r["models"]:
+        ready = _alive(m)
+        return {"main": m, "ready": ready, "mode": r["mode"], "msg": "آماده" if ready else "با اولین پیام بارگذاری می‌شود"}
+    return {"main": m, "ready": True, "mode": r["mode"], "msg": "مدل API"}
+
+
+# ---------- مدیریت پروفایل‌ها ----------
+def _entry(r, pid):
+    if pid in r["models"]:
+        return r["meta"].setdefault(pid, {})
+    if pid in r["profiles"]:
+        return r["profiles"][pid]
+    raise RuntimeError("چنین پروفایلی نیست")
+
+
+def set_main(pid):
+    with LOCK:
+        r = reg()
+        _entry(r, pid)
+        r["main"] = pid
+        _entry(r, pid)["enabled"] = True
+        save(r)
+
+
+def set_enabled(pid, flag):
+    with LOCK:
+        r = reg()
+        _entry(r, pid)["enabled"] = bool(flag)
+        if not flag and r["main"] == pid:
+            r["main"] = None
+        save(r)
+    if not flag:
+        unload(pid)
+
+
+def set_tags(pid, tags):
+    with LOCK:
+        r = reg()
+        _entry(r, pid)["tags"] = [t for t in tags if t in TAGS] or ["chat"]
+        save(r)
+
+
+def set_mode(mode):
+    if mode not in MODES:
+        raise RuntimeError("حالت نامعتبر")
+    with LOCK:
+        r = reg()
+        r["mode"] = mode
+        save(r)
+
+
+def set_max_loaded(n):
+    with LOCK:
+        r = reg()
+        r["max_loaded"] = max(1, min(4, int(n)))
+        save(r)
+
+
+def add_profile(name, url, key="", model="", tags=("chat",)):
+    with LOCK:
+        r = reg()
+        slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "api"
+        pid, i = f"r:{slug}", 2
+        while pid in r["profiles"]:
+            pid, i = f"r:{slug}{i}", i + 1
+        r["profiles"][pid] = {"name": name[:40] or slug, "provider": "openai", "url": norm_url(url), "key": key, "model": model,
+                              "tags": [t for t in tags if t in TAGS] or ["chat"], "enabled": True}
+        if not r["main"]:
+            r["main"] = pid
+        save(r)
+        return pid
+
+
+def remove_profile(pid):
+    with LOCK:
+        r = reg()
+        if pid not in r["profiles"]:
+            raise RuntimeError("فقط پروفایل‌های API حذف می‌شوند؛ مدل محلی را با «حذف» پاک کن")
+        del r["profiles"][pid]
+        if r["main"] == pid:
+            r["main"] = None
+        save(r)
 
 
 # ---------- دانلود ----------
@@ -72,7 +209,7 @@ def download(spec, on_progress=lambda d, t: None):
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"دانلود رد شد (HTTP {e.code}). آدرس را بررسی کن یا HF_ENDPOINT را روی یک آینه بگذار") from e
     if have and r.status != 206:
-        have = 0  # سرور Range را نادیده گرفت
+        have = 0
     cr = r.headers.get("Content-Range")
     total = int(cr.split("/")[-1]) if cr else int(r.headers.get("Content-Length", 0)) + have
     if total and shutil.disk_usage(MODELS).free < (total - have) * 1.1:
@@ -100,15 +237,16 @@ def download(spec, on_progress=lambda d, t: None):
 def delete(mid):
     with LOCK:
         r = reg()
-        if mid in (r["active"], r["advisor"]):
-            raise RuntimeError("این مدل در حال استفاده است؛ اول مدل دیگری را انتخاب کن")
+        if mid == r["main"]:
+            raise RuntimeError("این مدل اصلی است؛ اول مدل دیگری را «اصلی» کن")
         m = r["models"].get(mid)
+        unload(mid)
         if m:
             (MODELS / m["file"]).unlink(missing_ok=True)
         sync()
 
 
-# ---------- اجرای سرور ----------
+# ---------- اجرای llama-server با مدیریت منابع ----------
 def _up(port):
     try:
         urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
@@ -117,75 +255,106 @@ def _up(port):
         return False
 
 
-def stop(role):
-    p = procs.pop(role, None)
-    if p and p[0].poll() is None:
-        p[0].terminate()
-        try:
-            p[0].wait(10)
-        except subprocess.TimeoutExpired:
-            p[0].kill()
+def _port_free(port):
+    with socket.socket() as s:
+        return s.connect_ex(("127.0.0.1", port)) != 0
 
 
-def start(role, mid, wait=240):
-    if role in procs and procs[role][1] == mid and procs[role][0].poll() is None:
-        return
-    stop(role)
-    if not (shutil.which(LLAMA) or Path(LLAMA).exists()):
-        raise RuntimeError("llama-server پیدا نشد. در Termux: pkg install llama-cpp (یا مسیرش را در LLAMA_SERVER بگذار)")
-    f = MODELS / reg()["models"][mid]["file"]
-    p = subprocess.Popen([LLAMA, "-m", str(f), "--host", "127.0.0.1", "--port", str(PORTS[role]), "-c", "4096"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    procs[role] = (p, mid)
-    t = time.time()
-    while time.time() - t < wait:
-        if p.poll() is not None:
-            procs.pop(role, None)
-            raise RuntimeError("llama-server بسته شد (احتمالا RAM کم است یا فایل خراب)")
-        if _up(PORTS[role]):
-            return
-        time.sleep(1)
-    stop(role)
-    raise RuntimeError("بارگذاری مدل بیش از حد طول کشید")
+def tail(path, n=500):
+    try:
+        return "لاگ: " + Path(path).read_text(errors="ignore")[-n:].strip()
+    except Exception:
+        return ""
 
 
-def url_of(role):
-    return f"http://127.0.0.1:{PORTS[role]}/v1/chat/completions"
+def unload(mid):
+    with LOCK:
+        s = servers.pop(mid, None)
+        if s and s["p"].poll() is None:
+            s["p"].terminate()
+            try:
+                s["p"].wait(10)
+            except subprocess.TimeoutExpired:
+                s["p"].kill()
+
+
+def load(mid, wait=240):
+    """مدل محلی را (در صورت نیاز با خارج‌کردن قدیمی‌ترین مدل) بالا می‌آورد و پورتش را برمی‌گرداند."""
+    with LOCK:
+        r = reg()
+        if mid not in r["models"]:
+            raise RuntimeError("چنین مدل محلی‌ای نیست")
+        s = servers.get(mid)
+        if s and s["p"].poll() is None:
+            s["t"] = time.time()
+            return s["port"]
+        servers.pop(mid, None)
+        if not (shutil.which(LLAMA) or Path(LLAMA).exists()):
+            raise RuntimeError("llama-server پیدا نشد. در Termux: pkg install llama-cpp (یا مسیرش را در LLAMA_SERVER بگذار)")
+        alive = [m for m in servers if _alive(m)]
+        while len(alive) >= max(1, int(r["max_loaded"])):
+            lru = min(alive, key=lambda m: servers[m]["t"])
+            unload(lru)
+            alive.remove(lru)
+        used = {x["port"] for x in servers.values()}
+        port = next(p for p in range(PORT0, PORT0 + 60) if p not in used and _port_free(p))
+        log = LOGS / f"llama_{mid}.log"
+        cmd = [LLAMA, "-m", str(MODELS / r["models"][mid]["file"]), "--host", "127.0.0.1", "--port", str(port), "-c", "4096"]
+        with open(log, "wb") as lf:
+            p = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+        servers[mid] = {"p": p, "port": port, "t": time.time(), "log": log}
+        t0 = time.time()
+        while time.time() - t0 < wait:
+            if p.poll() is not None:
+                servers.pop(mid, None)
+                raise RuntimeError(f"llama-server بسته شد (کد {p.returncode}؛ احتمالا RAM کم، فایل خراب یا ناسازگاری پردازنده). {tail(log)}")
+            if _up(port):
+                return port
+            time.sleep(1)
+        unload(mid)
+        raise RuntimeError("بارگذاری مدل بیش از حد طول کشید. " + tail(log))
+
+
+def endpoint(pid):
+    r = reg()
+    if pid in r["models"]:
+        return {"url": f"http://127.0.0.1:{load(pid)}/v1/chat/completions"}
+    p = r["profiles"].get(pid)
+    if p:
+        return {"url": p["url"], "key": p.get("key", ""), "model": p.get("model", "")}
+    raise RuntimeError(f"پروفایل {pid} پیدا نشد")
+
+
+def advisor_pid():
+    """مشاور: اولین پروفایل فعالِ غیر اصلی (ترجیحا با برچسب review). در حالت single وجود ندارد."""
+    r = reg()
+    if r["mode"] == "single":
+        return None
+    others = [p for p in plist() if p["enabled"] and not p["main"]]
+    rev = [p for p in others if "review" in p["tags"]]
+    pick = rev or others
+    return pick[0]["id"] if pick else None
+
+
+def resolve(role):
+    r = reg()
+    if role == "brain":
+        return endpoint(r["main"]) if r["main"] else None
+    if role == "advisor":
+        a = advisor_pid()
+        return endpoint(a) if a else None
+    return endpoint(role)
+
+
+agent.RESOLVER = resolve
+agent.ADVISOR_FN = advisor_pid
 
 
 def apply():
-    """سرورها را طبق انتخاب فعلی روشن می‌کند و agent را به آن‌ها وصل می‌کند."""
-    with LOCK:
-        r = reg()
-        if r["active"]:
-            start("brain", r["active"])
-            agent.ENDPOINTS["brain"] = url_of("brain")
-        if r["remote_advisor"] and agent.online():
-            stop("advisor")
-            agent.ENDPOINTS["advisor"] = r["remote_advisor"]
-        elif r["advisor"]:
-            start("advisor", r["advisor"])
-            agent.ENDPOINTS["advisor"] = url_of("advisor")
-        else:
-            stop("advisor")
-            agent.ENDPOINTS["advisor"] = None
-
-
-def use(role, mid):
-    with LOCK:
-        r = reg()
-        if mid and mid not in r["models"]:
-            raise RuntimeError("چنین مدلی نیست")
-        r["active" if role == "brain" else "advisor"] = mid
-        save(r)
-        apply()
-
-
-def set_remote(url, key="", model=""):
+    """مدل اصلیِ محلی را از قبل بارگذاری می‌کند تا اولین پیام کند نباشد."""
     r = reg()
-    r["remote_advisor"] = {"url": url, "key": key, "model": model} if url else None
-    save(r)
-    apply()
+    if r["main"] in r["models"]:
+        load(r["main"])
 
 
 # ---------- بنچمارک (کاملا خودکار، بدون قاضی LLM) ----------
@@ -196,7 +365,6 @@ def _py_ok(code):
 def _run_tests(role):
     pts, tps = 0, None
     L = lambda p, **k: agent.llm(p, role=role, **k)
-    # 1) مسیریابی JSON و استخراج آرگومان (25)
     try:
         out = agent.extract_json(L(agent.ROUTER.format(tools="- add_numbers: add two numbers | run(a, b)", history="(none)",
                                                        request="جمع ۲۳ و ۱۹ رو حساب کن"), json_mode=True))
@@ -207,24 +375,20 @@ def _run_tests(role):
                 pts += 15
     except Exception:
         pass
-    # 2) کدنویسی (30) + سرعت
     try:
         t = time.time()
         txt = L("Write a Python function is_prime(n) that returns True if n is prime. Reply with one ```python block only.")
         dt = max(time.time() - t, 0.01)
         tps = round(len(txt) / 4 / dt, 1)
-        code = agent.extract_code(txt)
-        if _py_ok(code + "\nassert is_prime(2) and is_prime(97) and not is_prime(1) and not is_prime(91) and not is_prime(0)"):
+        if _py_ok(agent.extract_code(txt) + "\nassert is_prime(2) and is_prime(97) and not is_prime(1) and not is_prime(91) and not is_prime(0)"):
             pts += 30
     except Exception:
         pass
-    # 3) ریاضی/پیروی از دستور (10)
     try:
         if "391" in L("What is 17*23? Reply with only the number."):
             pts += 10
     except Exception:
         pass
-    # 4) فارسی (15)
     try:
         t = L("یک جمله کوتاه فارسی درباره دریا بنویس.")
         letters = [c for c in t if c.isalpha()]
@@ -232,7 +396,6 @@ def _run_tests(role):
             pts += 15
     except Exception:
         pass
-    # 5) رفع باگ (20)
     try:
         code = agent.extract_code(L("Fix the bug. Reply with one ```python block only:\n```python\ndef avg(xs):\n    return sum(xs)/(len(xs)+1)\n```"))
         if _py_ok(code + "\nassert avg([2,4])==3 and avg([5])==5"):
@@ -244,16 +407,14 @@ def _run_tests(role):
 
 def benchmark(mid):
     with LOCK:
-        running = procs.get("brain", (None, None))[1] == mid and procs["brain"][0].poll() is None
-        role = "brain" if running else "bench"
-        if not running:
-            start("bench", mid)
-            agent.ENDPOINTS["bench"] = url_of("bench")
+        was = _alive(mid)
+        port = load(mid)
+        agent.ENDPOINTS["bench"] = {"url": f"http://127.0.0.1:{port}/v1/chat/completions"}
         try:
-            score, tps = _run_tests(role)
+            score, tps = _run_tests("bench")
         finally:
-            if not running:
-                stop("bench")
+            if not was:
+                unload(mid)
         r = reg()
         r["models"][mid].update(score=score, tps=tps, bench_ts=int(time.time()))
         save(r)
@@ -261,17 +422,21 @@ def benchmark(mid):
 
 
 def autopick(on_progress=lambda m: None, use_council=True):
-    """همه‌ی مدل‌ها را تست می‌کند؛ بهترین (امتیاز، بعد سرعت) می‌شود مغز و دومی مشاور."""
+    """همه‌ی مدل‌های محلی را تست می‌کند؛ بهترین «اصلی» می‌شود و دومی (در صورت use_council) مشاور + حالت بحث و نقد."""
     ids = list(sync()["models"])
     if not ids:
         raise RuntimeError("مدلی دانلود نشده")
     for mid in ids:
         on_progress(f"تست {mid}")
         benchmark(mid)
-    r = reg()
-    ranked = sorted(ids, key=lambda m: (r["models"][m]["score"] or 0, r["models"][m]["tps"] or 0), reverse=True)
-    r["active"] = ranked[0]
-    r["advisor"] = ranked[1] if use_council and len(ranked) > 1 else None
-    save(r)
-    apply()
+    with LOCK:
+        r = reg()
+        ranked = sorted(ids, key=lambda m: (r["models"][m]["score"] or 0, r["models"][m]["tps"] or 0), reverse=True)
+        r["main"] = ranked[0]
+        if use_council and len(ranked) > 1:
+            r["meta"].setdefault(ranked[1], {}).update(tags=["review"], enabled=True)
+            r["mode"] = "debate"
+        else:
+            r["mode"] = "single"
+        save(r)
     return ranked

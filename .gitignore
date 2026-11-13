@@ -3,3 +3,4 @@ build/
 llama.cpp/
 app/src/main/jniLibs/
 local.properties
+app/src/main/assets/engines/
